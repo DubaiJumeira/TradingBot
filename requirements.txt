@@ -1,0 +1,32 @@
+ccxt==4.4.26
+pandas==2.2.3
+numpy==2.1.3
+python-telegram-bot==21.7
+python-dotenv==1.0.1
+ta==0.11.0
+schedule==1.2.2
+requests==2.32.3
+aiohttp==3.11.7
+websockets==13.1
+
+# --- Phase 1A: News Aggregator ---
+feedparser==6.0.11        # RSS parsing (Reuters, CNBC, ForexLive, CoinDesk, The Block)
+tweepy==4.14.0            # X/Twitter API v2 primary path
+praw==7.8.1               # Reddit API
+cachetools==5.5.0         # in-memory TTL cache
+rapidfuzz==3.10.1         # fuzzy title matching for dedup
+
+# --- Phase 1B: Sentiment Analysis ---
+vaderSentiment==3.3.2     # fast lexicon-based fallback (always available)
+transformers==4.46.3      # FinBERT model loading (primary path)
+# torch — install separately: `pip install torch --index-url https://download.pytorch.org/whl/cpu`
+#          FinBERT requires ~2GB RAM. If torch is missing, VADER is used automatically.
+
+# --- Phase 4C: Telegram chart images ---
+mplfinance==0.12.10b0     # candlestick chart rendering for signal alerts
+
+# --- Phase 7: Backtesting ---
+pyarrow>=17.0.0           # parquet IO for historical OHLCV storage
+
+# --- Phase 10: Dashboard ---
+flask>=3.0.0              # lightweight web UI for equity curve / trades / signals

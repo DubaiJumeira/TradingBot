@@ -1,0 +1,42 @@
+{
+  "status": "ok",
+  "totalResults": 4,
+  "articles": [
+    {
+      "source": {"id": "reuters", "name": "Reuters"},
+      "author": "Jane Reporter",
+      "title": "Fed signals rate cut possibility at next meeting, minutes show",
+      "description": "Federal Reserve officials discussed a potential rate cut at the next FOMC meeting, according to minutes released Wednesday.",
+      "url": "https://reuters.com/fed-minutes-rate-cut",
+      "publishedAt": "2026-04-08T18:00:00Z",
+      "content": "WASHINGTON — Federal Reserve officials discussed..."
+    },
+    {
+      "source": {"id": "bloomberg", "name": "Bloomberg"},
+      "author": "John Writer",
+      "title": "Oil prices surge 3% on OPEC production cut talks",
+      "description": "Crude oil prices jumped on reports OPEC+ is considering another production cut.",
+      "url": "https://bloomberg.com/oil-opec-cut",
+      "publishedAt": "2026-04-08T17:30:00Z",
+      "content": "Brent crude rose 3% to $87..."
+    },
+    {
+      "source": {"id": null, "name": "SomeBlog"},
+      "author": null,
+      "title": "[Removed]",
+      "description": null,
+      "url": "https://example.com/removed",
+      "publishedAt": "2026-04-08T10:00:00Z",
+      "content": null
+    },
+    {
+      "source": {"id": "cnbc", "name": "CNBC"},
+      "author": "Staff",
+      "title": "Gold hits record high as Treasury yields decline",
+      "description": "Gold futures settled at a record $2,410 per ounce on Wednesday.",
+      "url": "https://cnbc.com/gold-record-high",
+      "publishedAt": "2026-04-08T20:15:00Z",
+      "content": "Gold settled at $2,410..."
+    }
+  ]
+}

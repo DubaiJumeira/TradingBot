@@ -1,0 +1,36 @@
+{
+  "count": 3,
+  "results": [
+    {
+      "kind": "news",
+      "title": "BREAKING: SEC approves spot Ethereum ETF applications",
+      "published_at": "2026-04-08T14:23:00Z",
+      "created_at": "2026-04-08T14:23:00Z",
+      "url": "https://cryptopanic.com/news/12345/",
+      "source": {"title": "CoinDesk", "domain": "coindesk.com"},
+      "currencies": [{"code": "ETH", "title": "Ethereum"}],
+      "votes": {"positive": 42, "negative": 3, "important": 18},
+      "domain": "coindesk.com"
+    },
+    {
+      "kind": "news",
+      "title": "Bitcoin hashrate hits all-time high as mining difficulty rises",
+      "published_at": "2026-04-08T13:10:00Z",
+      "created_at": "2026-04-08T13:10:00Z",
+      "url": "https://cryptopanic.com/news/12346/",
+      "source": {"title": "The Block", "domain": "theblock.co"},
+      "currencies": [{"code": "BTC", "title": "Bitcoin"}],
+      "votes": {"positive": 15, "negative": 2, "important": 5},
+      "domain": "theblock.co"
+    },
+    {
+      "kind": "news",
+      "title": "",
+      "published_at": "2026-04-08T12:00:00Z",
+      "url": "https://cryptopanic.com/news/empty/",
+      "source": {"title": "BadSource"},
+      "currencies": [],
+      "votes": {}
+    }
+  ]
+}

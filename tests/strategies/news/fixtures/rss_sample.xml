@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Test Wire</title>
+    <link>https://example.com</link>
+    <description>Offline fixture feed</description>
+    <item>
+      <title>Breaking: Trump announces new 25% tariff on Chinese imports</title>
+      <link>https://example.com/trump-tariffs</link>
+      <description>President Trump announced a new 25% tariff on a range of Chinese imports effective immediately.</description>
+      <pubDate>Wed, 08 Apr 2026 14:30:00 GMT</pubDate>
+      <guid>https://example.com/trump-tariffs</guid>
+    </item>
+    <item>
+      <title>Powell: Fed will remain data-dependent on rate decisions</title>
+      <link>https://example.com/powell-data</link>
+      <description>Federal Reserve Chair Jerome Powell said the central bank will remain data-dependent.</description>
+      <pubDate>Wed, 08 Apr 2026 13:00:00 GMT</pubDate>
+      <guid>https://example.com/powell-data</guid>
+    </item>
+    <item>
+      <title>Gold hits record high as Treasury yields decline</title>
+      <link>https://example.com/gold-record</link>
+      <description>Gold futures settled at a record high as yields fell.</description>
+      <pubDate>Wed, 08 Apr 2026 12:15:00 GMT</pubDate>
+      <guid>https://example.com/gold-record</guid>
+    </item>
+  </channel>
+</rss>
