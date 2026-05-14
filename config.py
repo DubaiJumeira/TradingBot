@@ -248,6 +248,25 @@ class Config:
     TRAILING_STOP_STEP_PCT = float(os.getenv("TRAILING_STEP_PCT", "0.5"))
     ATR_POSITION_SCALE = float(os.getenv("ATR_POSITION_SCALE", "1.5"))
 
+    # Strategy selection — "momentum_breakout" runs the new 4H Donchian
+    # breakout system; "legacy_confluence" keeps the ICT/Wyckoff pipeline.
+    STRATEGY_MODE = os.getenv("STRATEGY_MODE", "legacy_confluence")
+
+    # Momentum breakout parameters
+    MOMENTUM_SMA_LONG = int(os.getenv("MOMENTUM_SMA_LONG", "200"))
+    MOMENTUM_SMA_SHORT = int(os.getenv("MOMENTUM_SMA_SHORT", "50"))
+    MOMENTUM_DONCHIAN = int(os.getenv("MOMENTUM_DONCHIAN", "20"))
+    MOMENTUM_ATR_PERIOD = int(os.getenv("MOMENTUM_ATR_PERIOD", "14"))
+    MOMENTUM_ATR_MEDIAN_PERIOD = int(os.getenv("MOMENTUM_ATR_MEDIAN_PERIOD", "50"))
+    MOMENTUM_ATR_STOP_MULT = float(os.getenv("MOMENTUM_ATR_STOP_MULT", "3.0"))
+    MOMENTUM_RISK_PCT = float(os.getenv("MOMENTUM_RISK_PCT", "1.0"))  # 1% of equity per trade
+    MOMENTUM_FEE_PCT = float(os.getenv("MOMENTUM_FEE_PCT", "0.05"))  # taker fee per side
+    MOMENTUM_SLIPPAGE_PCT = float(os.getenv("MOMENTUM_SLIPPAGE_PCT", "0.05"))  # per side
+    MOMENTUM_FUNDING_PCT_8H = float(os.getenv("MOMENTUM_FUNDING_PCT_8H", "0.01"))  # per 8h
+    MOMENTUM_FORCE_TEST_SIGNAL = (
+        os.getenv("MOMENTUM_FORCE_TEST_SIGNAL", "false").lower() == "true"
+    )
+
     # Kill Zones (UTC) — includes the new london_ny_overlap zone.
     KILL_ZONES = {
         "asian": (os.getenv("ASIAN_KZ_START", "00:00"), os.getenv("ASIAN_KZ_END", "03:00")),

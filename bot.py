@@ -28,6 +28,7 @@ from strategies.wyckoff_strategy import analyze_wyckoff
 from strategies.market_data import analyze_market_data
 from strategies.signal_generator import generate_signal
 from strategies.news_events import check_high_impact_events  # legacy fallback
+from strategies.momentum_breakout import MomentumBreakoutStrategy
 from utils.telegram_alerts import (
     alert_signal, alert_close, alert_stats,
     alert_error, alert_startup, send_message,
@@ -117,6 +118,18 @@ logger = logging.getLogger("TradingBot")
 _REACTIVE_POLL_INTERVAL = 30
 
 
+def _fmt_opt(v) -> str:
+    """Format an optional float for log lines; 'NA' for None/NaN."""
+    if v is None:
+        return "NA"
+    try:
+        if pd.isna(v):
+            return "NA"
+    except (TypeError, ValueError):
+        pass
+    return f"{float(v):.2f}"
+
+
 class TradingBot:
     def __init__(self):
         self.exchange = ExchangeHandler()
@@ -200,6 +213,19 @@ class TradingBot:
                 logger.warning("Telegram command bot init failed: %s", exc)
 
         self._last_reactive_check = datetime.min.replace(tzinfo=timezone.utc)
+
+        # Strategy mode dispatch.
+        self._momentum_strategy: MomentumBreakoutStrategy | None = None
+        self._last_4h_signal_time: dict[str, pd.Timestamp] = {}
+        # trade_id -> {"atr_at_entry": float, "highest_since_entry": float}
+        self._momentum_position_state: dict[str, dict] = {}
+        self._momentum_test_signal_fired = False
+        if Config.STRATEGY_MODE == "momentum_breakout":
+            self._momentum_strategy = MomentumBreakoutStrategy()
+            logger.info("STRATEGY_MODE=momentum_breakout (legacy confluence bypassed)")
+        else:
+            logger.info("STRATEGY_MODE=%s", Config.STRATEGY_MODE)
+
         logger.info(
             "Bot initialized (news=%s, calendar=%s, risk=%s, regime=%s)",
             "enabled" if self.aggregator else "disabled",
@@ -242,6 +268,11 @@ class TradingBot:
             From ReactiveAction.to_news_signal(). Passed through to
             signal_generator for news-enhanced scoring.
         """
+        # Branch on strategy mode. Momentum breakout runs the new 4H pipeline;
+        # legacy_confluence (default) runs the ICT/Wyckoff stack below.
+        if Config.STRATEGY_MODE == "momentum_breakout":
+            return self._analyze_momentum(symbol)
+
         try:
             # Look up per-instrument config (Phase 2).
             inst = get_instrument(symbol) or {}
@@ -372,6 +403,108 @@ class TradingBot:
             logger.error(f"Error analyzing {symbol}: {e}", exc_info=True)
             return None
 
+    # ==================================================================
+    # MOMENTUM BREAKOUT MODE
+    # ==================================================================
+
+    def _analyze_momentum(self, symbol: str) -> dict | None:
+        """4H Donchian breakout pipeline. Returns a signal dict matching the
+        legacy shape on entry, else None.
+
+        Logs the per-condition diagnostics every cycle so it's visible whether
+        the strategy is silent because of warmup, no breakout, or filter
+        veto."""
+        if self._momentum_strategy is None:
+            return None
+        try:
+            # Need enough bars for SMA-200 plus ATR-median-50 warmup.
+            ohlcv = self.exchange.fetch_ohlcv(symbol, "4h", limit=300)
+            df = self.ohlcv_to_df(ohlcv)
+            if df.index.tz is None:
+                df.index = df.index.tz_localize("UTC")
+            ind = self._momentum_strategy.compute_indicators(df)
+
+            last_idx = len(ind) - 1
+            last_ts = ind.index[last_idx]
+            diag = self._momentum_strategy.entry_diagnostics(ind, last_idx)
+            logger.info(
+                "%s 4H entry_conditions: ok=%s uptrend=%s breakout=%s "
+                "volatility=%s close=%.2f sma200=%s donch20=%s atr14=%s atr_med50=%s",
+                symbol, diag.get("ok"),
+                diag.get("cond_uptrend"), diag.get("cond_breakout"),
+                diag.get("cond_volatility"), diag.get("close", 0.0),
+                _fmt_opt(diag.get("sma_200")),
+                _fmt_opt(diag.get("donchian_high_20")),
+                _fmt_opt(diag.get("atr_14")),
+                _fmt_opt(diag.get("atr_median_50")),
+            )
+
+            # Test-signal override: force a synthetic long once so we can
+            # verify the Telegram + DB plumbing end-to-end.
+            if Config.MOMENTUM_FORCE_TEST_SIGNAL and not self._momentum_test_signal_fired:
+                self._momentum_test_signal_fired = True
+                close = float(ind["close"].iloc[-1])
+                atr = float(ind["atr_14"].iloc[-1]) if pd.notna(ind["atr_14"].iloc[-1]) else close * 0.01
+                stop = close - self._momentum_strategy.atr_stop_mult * atr
+                balance = self.exchange.paper.balance if self.exchange.paper else Config.STARTING_BALANCE
+                size = self._momentum_strategy.position_size(balance, close, stop)
+                logger.warning("MOMENTUM_FORCE_TEST_SIGNAL=true — emitting forced test signal for %s", symbol)
+                return self._momentum_signal_dict(symbol, close, stop, atr, size, forced=True)
+
+            # Same-bar dedupe: don't re-emit on the same 4H candle.
+            last_acted = self._last_4h_signal_time.get(symbol)
+            if last_acted is not None and last_ts <= last_acted:
+                return None
+
+            if not diag.get("ok"):
+                return None
+
+            close = float(ind["close"].iloc[-1])
+            atr = float(ind["atr_14"].iloc[-1])
+            stop = close - self._momentum_strategy.atr_stop_mult * atr
+            balance = self.exchange.paper.balance if self.exchange.paper else Config.STARTING_BALANCE
+            size = self._momentum_strategy.position_size(balance, close, stop)
+            if size <= 0:
+                logger.info("%s momentum: position_size <= 0 (balance=%.2f, atr=%.2f) — skipping", symbol, balance, atr)
+                return None
+
+            self._last_4h_signal_time[symbol] = last_ts
+            return self._momentum_signal_dict(symbol, close, stop, atr, size)
+
+        except Exception as exc:
+            logger.error("momentum analyze failed for %s: %s", symbol, exc, exc_info=True)
+            return None
+
+    def _momentum_signal_dict(
+        self,
+        symbol: str,
+        entry: float,
+        stop: float,
+        atr: float,
+        size_usd: float,
+        forced: bool = False,
+    ) -> dict:
+        # No fixed TP — set a sentinel far above so existing TP-hit logic
+        # never triggers. Exit handled by trailing stop + SMA-50 break in
+        # `_check_momentum_exits`.
+        tp_sentinel = entry + 1000.0 * atr if atr > 0 else entry * 100.0
+        return {
+            "symbol": symbol,
+            "side": "long",
+            "entry": round(entry, 2),
+            "sl": round(stop, 2),
+            "tp": round(tp_sentinel, 2),
+            "size_usd": size_usd,
+            "score": 100,
+            "leverage": 1,
+            "margin_usd": size_usd,
+            "liq_price": 0.0,
+            "tp_plan": None,
+            "reasons": ["momentum_breakout"] + (["forced_test"] if forced else []),
+            "strategy_mode": "momentum_breakout",
+            "atr_at_entry": atr,
+        }
+
     def check_exits(self):
         """Check trailing stops, then check if any SL or TP has been hit."""
         if not self.exchange.paper:
@@ -386,6 +519,12 @@ class TradingBot:
                     current_prices[sym] = ticker["last"]
                 except Exception as e:
                     logger.error(f"Could not fetch price for {sym}: {e}")
+
+        # Momentum mode: replace the structure-based trailing stop with the
+        # strategy's 3*ATR trail, and force-close on close-below-50-SMA.
+        if Config.STRATEGY_MODE == "momentum_breakout" and self._momentum_strategy is not None:
+            self._check_momentum_exits(current_prices)
+            return
 
         # Phase 6: structure-based trailing stop management.
         # Fetch 15m candles per symbol (once) for swing-point detection.
@@ -442,6 +581,107 @@ class TradingBot:
                     )
                 except Exception as exc:
                     logger.debug("DB close update failed: %s", exc)
+
+    def _check_momentum_exits(self, current_prices: dict[str, float]) -> None:
+        """Momentum-mode exit handler.
+
+        For each open position:
+          1. Refresh `highest_since_entry` from current price.
+          2. Set the position's SL to `highest_since_entry - 3 * ATR_at_entry`
+             (only moves up, never down) — this is the 3xATR trailing stop.
+          3. Fetch 4H candles and force-close on close < SMA-50.
+        Then run the standard paper.check_positions() to fire the SL if hit.
+        """
+        # Refresh trailing stops first.
+        per_symbol_4h: dict[str, Any] = {}
+        for tid, pos in list(self.exchange.paper.positions.items()):
+            sym = pos["symbol"]
+            price = current_prices.get(sym)
+            if price is None:
+                continue
+
+            state = self._momentum_position_state.get(str(tid))
+            if state is None:
+                # Position opened without our state tracking — bootstrap from
+                # what we can recover. Use entry as the initial high and a
+                # rough ATR estimate (entry - sl) / 3.
+                atr_at_entry = max(1e-9, (pos["entry_price"] - pos["sl_price"]) / 3.0)
+                state = {
+                    "atr_at_entry": atr_at_entry,
+                    "highest_since_entry": max(pos["entry_price"], price),
+                }
+                self._momentum_position_state[str(tid)] = state
+
+            if price > state["highest_since_entry"]:
+                state["highest_since_entry"] = price
+
+            new_sl = state["highest_since_entry"] - self._momentum_strategy.atr_stop_mult * state["atr_at_entry"]
+            if new_sl > pos["sl_price"]:
+                self.exchange.paper.update_sl(tid, round(new_sl, 2))
+
+            # 4H SMA-50 break check — only once per symbol per cycle.
+            if sym not in per_symbol_4h:
+                try:
+                    ohlcv = self.exchange.fetch_ohlcv(sym, "4h", limit=120)
+                    df = self.ohlcv_to_df(ohlcv)
+                    if df.index.tz is None:
+                        df.index = df.index.tz_localize("UTC")
+                    per_symbol_4h[sym] = self._momentum_strategy.compute_indicators(df)
+                except Exception as exc:
+                    logger.debug("4h fetch for SMA-50 check failed (%s): %s", sym, exc)
+                    per_symbol_4h[sym] = None
+
+            ind = per_symbol_4h.get(sym)
+            if ind is not None and not ind.empty:
+                last_close = float(ind["close"].iloc[-1])
+                last_sma50 = ind["sma_50"].iloc[-1]
+                if pd.notna(last_sma50) and last_close < float(last_sma50):
+                    # Force-close at current market.
+                    logger.info("%s momentum exit: close < SMA-50 (%.2f < %.2f) — closing",
+                                sym, last_close, float(last_sma50))
+                    closed = self.exchange.paper.close_manual(tid, price)
+                    if closed is not None:
+                        closed.setdefault("result", "sma_50_break")
+                        alert_close(closed)
+                        if self.risk_manager is not None:
+                            self.risk_manager.record_trade_close(
+                                pnl=closed.get("pnl", 0) or 0,
+                                equity=self.exchange.paper.balance,
+                            )
+                        if self.db is not None:
+                            try:
+                                self.db.close_trade(
+                                    trade_id=str(tid),
+                                    exit_price=closed.get("exit_price", price),
+                                    pnl=closed.get("pnl", 0) or 0,
+                                    result="sma_50_break",
+                                )
+                            except Exception as exc:
+                                logger.debug("DB close update failed: %s", exc)
+                        self._momentum_position_state.pop(str(tid), None)
+
+        # Standard SL/TP scan (catches the trailing SL we just updated).
+        events = self.exchange.paper.check_positions(current_prices)
+        for event in events:
+            if event.get("partial"):
+                continue
+            alert_close(event)
+            if self.risk_manager is not None:
+                self.risk_manager.record_trade_close(
+                    pnl=event.get("pnl", 0) or 0,
+                    equity=self.exchange.paper.balance,
+                )
+            if self.db is not None:
+                try:
+                    self.db.close_trade(
+                        trade_id=str(event.get("id")),
+                        exit_price=event.get("exit_price", 0),
+                        pnl=event.get("pnl", 0) or 0,
+                        result=event.get("result", "?"),
+                    )
+                except Exception as exc:
+                    logger.debug("DB close update failed: %s", exc)
+            self._momentum_position_state.pop(str(event.get("id")), None)
 
     def run_cycle(self):
         """Run one full REGULAR analysis cycle across all symbols."""
@@ -537,6 +777,15 @@ class TradingBot:
                     liq_price=signal.get("liq_price", 0.0),
                     tp_plan=signal.get("tp_plan"),
                 )
+
+                # Momentum mode: stash ATR-at-entry + initial highest for the
+                # trailing-stop trail to use later.
+                if signal.get("strategy_mode") == "momentum_breakout":
+                    tid = trade.get("id") if isinstance(trade, dict) else trade
+                    self._momentum_position_state[str(tid)] = {
+                        "atr_at_entry": float(signal.get("atr_at_entry", 0.0)),
+                        "highest_since_entry": float(signal["entry"]),
+                    }
 
                 # Phase 10: persist to DB.
                 if self.db is not None:
@@ -769,6 +1018,14 @@ class TradingBot:
         # Phase 5: recompute self-optimizer weights daily at 00:30 UTC.
         if self.db is not None:
             schedule.every().day.at("00:30").do(self._recompute_optimizer_weights)
+
+        # Dump 24h observed liquidation events every 30s so the dashboard
+        # (separate process) can overlay them on the heatmap.
+        try:
+            from strategies.liquidation_stream import dump_recent_events
+            schedule.every(30).seconds.do(dump_recent_events)
+        except Exception as exc:
+            logger.debug("Could not schedule liquidation dump: %s", exc)
 
         # Run first cycle immediately.
         self.run_cycle()
