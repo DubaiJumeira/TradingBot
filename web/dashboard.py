@@ -47,6 +47,32 @@ def _load_db():
         return None
 
 
+_dashboard_exchange = None
+
+
+def _get_exchange():
+    """Return a cached public-data ccxt client for orderbook fetches.
+
+    The dashboard runs in its own process, separate from the bot. We
+    instantiate a *public-only* exchange client here (no API keys
+    needed — order books are public data).
+    """
+    global _dashboard_exchange
+    if _dashboard_exchange is not None:
+        return _dashboard_exchange
+    try:
+        import ccxt
+        from config import Config
+        cls = getattr(ccxt, Config.EXCHANGE)
+        _dashboard_exchange = cls({"options": {"defaultType": "swap"}})
+        if Config.EXCHANGE_TESTNET:
+            _dashboard_exchange.set_sandbox_mode(True)
+        return _dashboard_exchange
+    except Exception as exc:
+        logger.warning(f"Could not init dashboard exchange: {exc}")
+        return None
+
+
 @app.route("/api/stats")
 def api_stats():
     state = _load_paper_state()
@@ -472,6 +498,110 @@ def api_news_impact():
     except Exception as e:
         logger.warning(f"Could not fetch news impact: {e}")
         return jsonify({"news_triggered_count": 0, "trades": []})
+
+
+@app.route("/api/liquidity-heatmap/<symbol>")
+def api_liquidity_heatmap(symbol: str):
+    """Real liquidity heatmap for a symbol.
+
+    Combines:
+      - Deep orderbook walls (500 levels, real resting limit orders)
+      - Observed 24h liquidation events (from shared JSON dump)
+
+    No synthetic data — every level shown is real.
+    """
+    symbol = symbol.upper()
+    ex = _get_exchange()
+    if ex is None:
+        return jsonify({"error": "exchange unavailable"}), 503
+
+    try:
+        ticker = ex.fetch_ticker(symbol)
+        price = float(ticker.get("last") or 0)
+    except Exception as exc:
+        return jsonify({"error": f"ticker fetch failed: {exc}"}), 502
+
+    if price <= 0:
+        return jsonify({"error": "invalid price"}), 502
+
+    walls = []
+    try:
+        from strategies.orderbook_liquidity import fetch_orderbook_walls
+        walls_objs = fetch_orderbook_walls(ex, symbol, price, depth=500, bucket_pct=0.05, top_n_per_side=80)
+        walls = [
+            {
+                "price": w.price,
+                "side": w.side,
+                "volume_usd": w.volume_usd,
+                "distance_pct": w.distance_pct,
+            }
+            for w in walls_objs
+        ]
+    except Exception as exc:
+        logger.warning(f"orderbook walls failed for {symbol}: {exc}")
+
+    volume_profile = []
+    try:
+        from strategies.volume_profile import fetch_volume_profile
+        nodes = fetch_volume_profile(ex, symbol, price, timeframe="1h", lookback_candles=500, num_buckets=80)
+        volume_profile = [
+            {"price": n.price, "volume_usd": n.volume_usd, "distance_pct": n.distance_pct}
+            for n in nodes
+        ]
+    except Exception as exc:
+        logger.warning(f"volume profile failed for {symbol}: {exc}")
+
+    liquidations = []
+    try:
+        liq_file = ROOT / "data" / "observed_liquidations.json"
+        if liq_file.exists():
+            with open(liq_file) as f:
+                data = json.load(f)
+            for e in data.get("events", []):
+                if e.get("symbol") != symbol:
+                    continue
+                liquidations.append({
+                    "ts": e.get("ts"),
+                    "side": e.get("side"),
+                    "price": e.get("price"),
+                    "qty_usd": e.get("qty_usd"),
+                    "exchange": e.get("exchange"),
+                })
+    except Exception as exc:
+        logger.debug(f"liq dump read failed: {exc}")
+
+    total_bid_vol = sum(w["volume_usd"] for w in walls if w["side"] == "bid")
+    total_ask_vol = sum(w["volume_usd"] for w in walls if w["side"] == "ask")
+    asym_ratio = 1.0
+    dominant = "balanced"
+    if total_bid_vol > 0 and total_ask_vol > 0:
+        ratio = max(total_bid_vol, total_ask_vol) / min(total_bid_vol, total_ask_vol)
+        asym_ratio = round(ratio, 2)
+        if ratio >= 1.5:
+            dominant = "bids (support)" if total_bid_vol > total_ask_vol else "asks (resistance)"
+
+    vp_range = (None, None)
+    if volume_profile:
+        dists = [n["distance_pct"] for n in volume_profile]
+        vp_range = (min(dists), max(dists))
+
+    return jsonify({
+        "symbol": symbol,
+        "current_price": price,
+        "walls": walls,
+        "liquidations": liquidations,
+        "volume_profile": volume_profile,
+        "stats": {
+            "total_bid_volume_usd": round(total_bid_vol, 2),
+            "total_ask_volume_usd": round(total_ask_vol, 2),
+            "asymmetry_ratio": asym_ratio,
+            "dominant_side": dominant,
+            "wall_count": len(walls),
+            "liquidation_event_count": len(liquidations),
+            "volume_profile_buckets": len(volume_profile),
+            "volume_profile_range_pct": vp_range,
+        },
+    })
 
 
 @app.route("/")
@@ -973,6 +1103,31 @@ tr:hover td { background: rgba(57,255,20,.05); }
 </div>
 
 
+<!-- Liquidity Heatmap — real orderbook + observed liquidations -->
+<div class="grid">
+  <div class="card" style="padding: 18px 18px 12px;">
+    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom: 12px;">
+      <div class="label" style="margin-bottom:0;">Liquidity Heatmap (Real Orderbook · 24h Liquidations)</div>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <select id="heatmap-symbol" style="background:var(--card); color:var(--text); border:1px solid var(--border); padding:6px 10px; border-radius:6px; font-size:12px;">
+          <option value="BTCUSDT">BTCUSDT</option>
+          <option value="ETHUSDT">ETHUSDT</option>
+          <option value="SOLUSDT">SOLUSDT</option>
+        </select>
+        <span id="heatmap-price" style="font-family:'JetBrains Mono',monospace; color:var(--text); font-weight:600;">—</span>
+      </div>
+    </div>
+    <div style="display:grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap:12px; margin-bottom:12px;">
+      <div class="row" style="margin:0;"><span class="row-label">Bids $</span><span class="row-value pos" id="hm-bids">$0</span></div>
+      <div class="row" style="margin:0;"><span class="row-label">Asks $</span><span class="row-value neg" id="hm-asks">$0</span></div>
+      <div class="row" style="margin:0;"><span class="row-label">Asymmetry</span><span class="row-value" id="hm-asym">1.0×</span></div>
+      <div class="row" style="margin:0;"><span class="row-label">Dominant</span><span class="row-value" id="hm-dom">—</span></div>
+    </div>
+    <canvas id="heatmap-canvas" style="max-height: 520px;"></canvas>
+  </div>
+</div>
+
+
 <!-- Signal Analytics -->
 <div class="grid grid-2">
   <div class="card">
@@ -1319,6 +1474,210 @@ async function refresh() {
 
 refresh();
 setInterval(refresh, 10000);
+
+
+// ============================================================
+// Liquidity Heatmap (real orderbook depth + 24h liquidations)
+// ============================================================
+let heatmapChart = null;
+
+async function refreshHeatmap() {
+  const sym = document.getElementById('heatmap-symbol').value;
+  try {
+    const res = await fetch('/api/liquidity-heatmap/' + sym);
+    if (!res.ok) return;
+    const d = await res.json();
+    if (!d || !d.volume_profile) return;
+
+    const fmtUsd = (v) => {
+      if (v >= 1e9) return '$' + (v/1e9).toFixed(2) + 'B';
+      if (v >= 1e6) return '$' + (v/1e6).toFixed(2) + 'M';
+      if (v >= 1e3) return '$' + (v/1e3).toFixed(1) + 'K';
+      return '$' + v.toFixed(0);
+    };
+
+    document.getElementById('heatmap-price').textContent = '$' + d.current_price.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+    document.getElementById('hm-bids').textContent = fmtUsd(d.stats.total_bid_volume_usd || 0);
+    document.getElementById('hm-asks').textContent = fmtUsd(d.stats.total_ask_volume_usd || 0);
+    document.getElementById('hm-asym').textContent = (d.stats.asymmetry_ratio || 1).toFixed(2) + '×';
+    document.getElementById('hm-dom').textContent = d.stats.dominant_side || 'balanced';
+
+    // Volume profile is the wide-scale backbone (weeks of real traded
+    // volume bucketed by price). Overlay orderbook walls for the
+    // near-term precise walls, and observed liquidations as markers.
+    const vp = d.volume_profile.slice().sort((a, b) => a.price - b.price);
+
+    // Map orderbook walls to the nearest VP bucket for overlay
+    const wallBid = new Array(vp.length).fill(0);
+    const wallAsk = new Array(vp.length).fill(0);
+    const findBucket = (price) => {
+      let best = 0, bestDist = Infinity;
+      for (let i = 0; i < vp.length; i++) {
+        const dist = Math.abs(vp[i].price - price);
+        if (dist < bestDist) { bestDist = dist; best = i; }
+      }
+      return best;
+    };
+    (d.walls || []).forEach(w => {
+      const i = findBucket(w.price);
+      if (w.side === 'bid') wallBid[i] += w.volume_usd;
+      else wallAsk[i] += w.volume_usd;
+    });
+
+    const liqLong = new Array(vp.length).fill(0);
+    const liqShort = new Array(vp.length).fill(0);
+    (d.liquidations || []).forEach(ev => {
+      const i = findBucket(ev.price);
+      if (ev.side === 'long') liqLong[i] += ev.qty_usd || 0;
+      else liqShort[i] += ev.qty_usd || 0;
+    });
+
+    // Split VP into above/below for bipolar visual (below current = green, above = red)
+    const vpBelow = vp.map(n => n.price <= d.current_price ? n.volume_usd : 0);
+    const vpAbove = vp.map(n => n.price > d.current_price ? -n.volume_usd : 0);
+
+    const labels = vp.map(n => n.price.toFixed(2));
+
+    const ctx = document.getElementById('heatmap-canvas').getContext('2d');
+    if (heatmapChart) heatmapChart.destroy();
+
+    heatmapChart = new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels: labels,
+        datasets: [
+          {
+            label: 'Volume Profile · Below (20d)',
+            data: vpBelow,
+            backgroundColor: 'rgba(34, 197, 94, 0.35)',
+            borderColor: 'rgba(34, 197, 94, 0.6)',
+            borderWidth: 0,
+            stack: 'volprofile',
+            barPercentage: 1.0,
+            categoryPercentage: 1.0,
+          },
+          {
+            label: 'Volume Profile · Above (20d)',
+            data: vpAbove,
+            backgroundColor: 'rgba(239, 68, 68, 0.35)',
+            borderColor: 'rgba(239, 68, 68, 0.6)',
+            borderWidth: 0,
+            stack: 'volprofile',
+            barPercentage: 1.0,
+            categoryPercentage: 1.0,
+          },
+          {
+            label: 'Orderbook Bids (Live)',
+            data: wallBid,
+            backgroundColor: 'rgba(34, 197, 94, 1.0)',
+            borderColor: 'rgba(34, 197, 94, 1)',
+            borderWidth: 0,
+            stack: 'live',
+            barPercentage: 0.55,
+            categoryPercentage: 1.0,
+          },
+          {
+            label: 'Orderbook Asks (Live)',
+            data: wallAsk.map(v => -v),
+            backgroundColor: 'rgba(239, 68, 68, 1.0)',
+            borderColor: 'rgba(239, 68, 68, 1)',
+            borderWidth: 0,
+            stack: 'live',
+            barPercentage: 0.55,
+            categoryPercentage: 1.0,
+          },
+          {
+            label: 'Longs Liquidated (24h)',
+            data: liqLong,
+            backgroundColor: 'rgba(234, 179, 8, 1)',
+            borderColor: 'rgba(234, 179, 8, 1)',
+            borderWidth: 0,
+            stack: 'liq',
+            barPercentage: 0.35,
+            categoryPercentage: 1.0,
+          },
+          {
+            label: 'Shorts Liquidated (24h)',
+            data: liqShort.map(v => -v),
+            backgroundColor: 'rgba(168, 85, 247, 1)',
+            borderColor: 'rgba(168, 85, 247, 1)',
+            borderWidth: 0,
+            stack: 'liq',
+            barPercentage: 0.35,
+            categoryPercentage: 1.0,
+          },
+        ],
+      },
+      options: {
+        indexAxis: 'y',
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: {
+            position: 'top',
+            labels: { color: '#e2e8f0', font: { size: 11 }, boxWidth: 12, padding: 12 },
+          },
+          tooltip: {
+            backgroundColor: 'rgba(13, 20, 33, 0.95)',
+            borderColor: 'rgba(26, 37, 53, 1)',
+            borderWidth: 1,
+            titleColor: '#e2e8f0',
+            bodyColor: '#e2e8f0',
+            callbacks: {
+              label: (ctx) => {
+                const v = Math.abs(ctx.parsed.x || 0);
+                if (v === 0) return null;
+                return ctx.dataset.label + ': ' + fmtUsd(v);
+              },
+              title: (items) => {
+                const price = items[0].label;
+                const pct = ((parseFloat(price) - d.current_price) / d.current_price * 100).toFixed(2);
+                return '$' + price + '  (' + (pct >= 0 ? '+' : '') + pct + '%)';
+              },
+            },
+          },
+        },
+        scales: {
+          x: {
+            stacked: false,
+            grid: { color: 'rgba(26, 37, 53, 0.5)' },
+            ticks: {
+              color: '#64748b',
+              font: { size: 10 },
+              callback: (v) => {
+                const a = Math.abs(v);
+                if (a >= 1e9) return '$' + (a/1e9).toFixed(1) + 'B';
+                if (a >= 1e6) return '$' + (a/1e6).toFixed(0) + 'M';
+                if (a >= 1e3) return '$' + (a/1e3).toFixed(0) + 'K';
+                return '$' + a;
+              },
+            },
+          },
+          y: {
+            stacked: false,
+            grid: { color: 'rgba(26, 37, 53, 0.3)' },
+            ticks: {
+              color: '#64748b',
+              font: { family: 'JetBrains Mono, monospace', size: 9 },
+              autoSkip: true,
+              maxTicksLimit: 30,
+              callback: function(value) {
+                return parseFloat(this.getLabelForValue(value)).toFixed(2);
+              },
+            },
+          },
+        },
+      },
+    });
+  } catch (e) {
+    console.error('heatmap refresh failed', e);
+  }
+}
+
+document.getElementById('heatmap-symbol').addEventListener('change', refreshHeatmap);
+refreshHeatmap();
+setInterval(refreshHeatmap, 15000);
 </script>
 
 </body>

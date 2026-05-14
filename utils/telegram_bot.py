@@ -915,17 +915,25 @@ def build_liquidation_handler(bot_instance) -> Callable:
         from strategies.liquidation import fetch_liquidation_clusters
         from strategies.liquidity_magnets import detect_magnets, compute_asymmetry
 
-        clusters, source = fetch_liquidation_clusters(symbol, price, oi_value)
+        clusters, source = fetch_liquidation_clusters(symbol, price, oi_value, exchange=bot_instance.exchange)
         magnets = detect_magnets(clusters, price)
         asym = compute_asymmetry(magnets)
 
         if not magnets:
             return f"🔥 No liquidation data for <b>{symbol}</b> <i>(source={source})</i>"
 
-        above = [m for m in magnets if m.direction == "above"][:5]
-        below = [m for m in magnets if m.direction == "below"][:5]
-        above.sort(key=lambda m: m.distance_pct)
-        below.sort(key=lambda m: m.distance_pct)
+        # Sort by volume desc, take top 10 per side (biggest real walls),
+        # then re-sort by distance for readable display.
+        def _pick_side(direction: str) -> list:
+            side_all = [m for m in magnets if m.direction == direction]
+            if not side_all:
+                return []
+            side_all.sort(key=lambda m: m.estimated_volume_usd, reverse=True)
+            top = side_all[:10]
+            return sorted(top, key=lambda m: m.distance_pct)
+
+        above = _pick_side("above")
+        below = _pick_side("below")
 
         dominant = asym.get('dominant', 'balanced')
         dom_icon = "⬆️" if dominant == "above" else ("⬇️" if dominant == "below" else "⚖️")

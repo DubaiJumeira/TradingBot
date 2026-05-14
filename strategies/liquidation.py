@@ -211,33 +211,25 @@ def fetch_liquidation_clusters(
     symbol: str,
     current_price: float,
     open_interest_usd: float,
+    exchange=None,
 ) -> tuple[list[LiquidationCluster], str]:
-    """Unified entry point for liquidation clusters.
+    """Unified entry point for real liquidity clusters.
 
-    Priority order:
-      1. ``observed`` — real liquidation events streamed from Binance
-         and Bybit WebSockets (see ``strategies.liquidation_stream``).
-         This is actual observed liquidity, not a model.
-      2. ``coinglass`` — paid REST heatmap, if ``COINGLASS_API_KEY`` is set.
-      3. ``estimator`` — synthetic fallback built from leverage tiers
-         and current OI. Always available.
+    Only real data sources — no synthetic estimation. Priority:
+
+      1. ``coinglass`` — paid REST liquidation heatmap (if key set).
+      2. ``observed+orderbook`` — 24h observed liquidations (WS) merged
+         with current deep order book walls (resting limit orders).
+      3. ``orderbook`` — deep order book only, if observed buffer is thin.
+      4. ``observed`` — observed liquidations only, if exchange unavailable.
+
+    ``open_interest_usd`` is accepted for backwards compatibility but no
+    longer used — the synthetic estimator is gone.
 
     Returns
     -------
     (clusters, source)
     """
-    try:
-        from strategies.liquidation_stream import (
-            ensure_stream_started,
-            get_real_liquidation_clusters,
-        )
-        ensure_stream_started()
-        observed = get_real_liquidation_clusters(symbol, current_price)
-        if observed:
-            return observed, "observed"
-    except Exception as exc:
-        logger.debug("observed liquidation path failed for %s: %s", symbol, exc)
-
     client = get_coinglass_client()
     if client is not None:
         payload = client.liquidation_heatmap(symbol)
@@ -246,7 +238,38 @@ def fetch_liquidation_clusters(
             if parsed:
                 return parsed, "coinglass"
 
-    return estimate_liquidation_levels(current_price, open_interest_usd), "estimator"
+    observed: list[LiquidationCluster] = []
+    try:
+        from strategies.liquidation_stream import (
+            ensure_stream_started,
+            get_real_liquidation_clusters,
+        )
+        ensure_stream_started()
+        observed = get_real_liquidation_clusters(symbol, current_price)
+    except Exception as exc:
+        logger.debug("observed liquidation path failed for %s: %s", symbol, exc)
+
+    orderbook: list[LiquidationCluster] = []
+    if exchange is not None:
+        try:
+            from strategies.orderbook_liquidity import (
+                fetch_orderbook_walls,
+                walls_to_cluster_format,
+            )
+            walls = fetch_orderbook_walls(exchange, symbol, current_price)
+            orderbook = walls_to_cluster_format(walls)
+        except Exception as exc:
+            logger.debug("orderbook fetch failed for %s: %s", symbol, exc)
+
+    if observed and orderbook:
+        merged = list(observed) + list(orderbook)
+        merged.sort(key=lambda c: abs(c.distance_pct))
+        return merged, "observed+orderbook"
+    if orderbook:
+        return orderbook, "orderbook"
+    if observed:
+        return observed, "observed"
+    return [], "unavailable"
 
 
 def _parse_coinglass_heatmap(data: dict, current_price: float) -> list[LiquidationCluster]:

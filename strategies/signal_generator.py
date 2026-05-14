@@ -232,7 +232,11 @@ def generate_signal(symbol: str, current_price: float, ict: dict, wyckoff: dict,
             reasons.append(f"Bearish inducement: minor high swept @ {ind['minor_level']:.2f}")
 
     # Phase 3: Premium / Discount zone filter
+    # Counter-zone entries (long-in-premium / short-in-discount) were a
+    # majority of the 2026-04-19/20 losing trades — marking them with a
+    # hard-veto flag so the signal is rejected before emission.
     price_zone = ict.get("price_zone", "equilibrium")
+    counter_zone_veto = False
     if side == "long" and price_zone == "discount":
         score += 5
         reasons.append("Price in discount zone (below equilibrium)")
@@ -240,11 +244,11 @@ def generate_signal(symbol: str, current_price: float, ict: dict, wyckoff: dict,
         score += 5
         reasons.append("Price in premium zone (above equilibrium)")
     elif side == "long" and price_zone == "premium":
-        score -= 5
-        reasons.append("Warning: long entry in premium zone")
+        counter_zone_veto = True
+        reasons.append("VETO: long entry in premium zone (counter-trend setup)")
     elif side == "short" and price_zone == "discount":
-        score -= 5
-        reasons.append("Warning: short entry in discount zone")
+        counter_zone_veto = True
+        reasons.append("VETO: short entry in discount zone (counter-trend setup)")
 
     # =========================================
     # 2. WYCKOFF PHASE (max 25 pts)
@@ -365,6 +369,31 @@ def generate_signal(symbol: str, current_price: float, ict: dict, wyckoff: dict,
     if poc and abs(current_price - poc) / current_price < 0.005:
         score += 5
         reasons.append(f"Price near Volume POC ({poc:.2f})")
+
+    # Deep Volume Profile (20d real traded volume) — HVN targeting.
+    # Trading toward a nearby high-volume node is high probability: HVNs
+    # are where markets have historically accepted size, so price
+    # tends to mean-revert / decelerate into them. Within 5% counts as
+    # "reachable" on intraday timeframes.
+    hvn_tp_candidate: float | None = None
+    vp_deep = market.get("volume_profile_deep", {})
+    hvns = vp_deep.get("hvn", []) or []
+    if side and hvns:
+        if side == "long":
+            aligned_hvns = [h for h in hvns if h["price"] > current_price]
+        else:
+            aligned_hvns = [h for h in hvns if h["price"] < current_price]
+        if aligned_hvns:
+            nearest = min(aligned_hvns, key=lambda h: abs(h["distance_pct"]))
+            dist_pct = abs(nearest["distance_pct"])
+            if dist_pct <= 5.0:
+                bonus = 10 if dist_pct <= 2.0 else 6
+                score += bonus
+                reasons.append(
+                    f"📊 Trading toward HVN: ${nearest['volume_usd']/1e9:.1f}B "
+                    f"@ {nearest['price']:.2f} ({dist_pct:.2f}% away)"
+                )
+                hvn_tp_candidate = nearest["price"]
 
     # =========================================
     # 4. KILL ZONE (max 15 pts)
@@ -676,19 +705,19 @@ def generate_signal(symbol: str, current_price: float, ict: dict, wyckoff: dict,
     entry, sl, tp = find_entry_sl_tp(ict, wyckoff, market, current_price, side)
 
     # Enforce minimum SL distance to avoid noise-level stops.
-    # Stops tighter than max(0.5×ATR14, 0.5% of entry) get wicked out by
-    # normal 15m volatility — perfectly correct-direction trades can still
-    # lose (see 2026-04-17 trades #2 and #3). Widening SL here reduces
-    # RR, so some marginal signals will now fail the RR gate instead of
-    # entering with a broken stop.
+    # Observed losers (2026-04-19 → 2026-04-20 paper run): every single
+    # SL-hit loss closed with 0/3 TPs filled, meaning price moved against
+    # the position and tagged SL before reaching even TP1. Raising the
+    # floor from 0.5×ATR/0.5% → 1.0×ATR/0.8% gives normal chop more room.
+    # This reduces RR so some marginal signals will fail the RR gate.
     if ltf_df is not None and len(ltf_df) >= 15:
         try:
             from strategies.risk_manager import calculate_atr
             atr = calculate_atr(ltf_df, period=14)
         except Exception:
             atr = 0.0
-        atr_floor = atr * 0.5
-        pct_floor = entry * 0.005
+        atr_floor = atr * 1.0
+        pct_floor = entry * 0.008
         min_sl_dist = max(atr_floor, pct_floor)
         current_sl_dist = abs(entry - sl)
         if current_sl_dist < min_sl_dist and min_sl_dist > 0:
@@ -701,23 +730,87 @@ def generate_signal(symbol: str, current_price: float, ict: dict, wyckoff: dict,
                 f"(was {current_sl_dist:.2f}, ATR={atr:.2f})"
             )
 
-    # Phase 1D: if a liquidation magnet sits beyond the ICT TP (i.e. a
-    # denser liquidity pool is within reach), extend the TP there. The
-    # cascade through a cluster typically produces extra momentum, so
-    # this is essentially free reward when it aligns.
-    if liq_magnet_tp is not None:
-        if side == "long" and liq_magnet_tp > tp:
-            reasons.append(
-                f"TP extended to liquidation magnet @ {liq_magnet_tp:.2f} "
-                f"(ICT TP was {tp:.2f})"
-            )
-            tp = liq_magnet_tp
-        elif side == "short" and liq_magnet_tp < tp:
-            reasons.append(
-                f"TP extended to liquidation magnet @ {liq_magnet_tp:.2f} "
-                f"(ICT TP was {tp:.2f})"
-            )
-            tp = liq_magnet_tp
+    # Phase 1D: pick the best aligned TP magnet. Candidates are:
+    #   - liq_magnet_tp (observed/orderbook liquidation cluster)
+    #   - hvn_tp_candidate (20d high-volume node — historical magnet)
+    # We only EXTEND the TP (never pull it in), because tightening TP
+    # below ICT structure would force early exits before the planned
+    # move completes. Between the two candidates pick the FARTHER one
+    # still in the trade's direction — it gives the larger reward.
+    best_magnet_tp: float | None = None
+    for candidate in (liq_magnet_tp, hvn_tp_candidate):
+        if candidate is None:
+            continue
+        if side == "long" and candidate > tp:
+            if best_magnet_tp is None or candidate > best_magnet_tp:
+                best_magnet_tp = candidate
+        elif side == "short" and candidate < tp:
+            if best_magnet_tp is None or candidate < best_magnet_tp:
+                best_magnet_tp = candidate
+
+    if best_magnet_tp is not None:
+        kind = "HVN" if best_magnet_tp == hvn_tp_candidate else "liquidation magnet"
+        reasons.append(
+            f"TP extended to {kind} @ {best_magnet_tp:.2f} "
+            f"(ICT TP was {tp:.2f})"
+        )
+        tp = best_magnet_tp
+
+    # Wall-aware SL tightening: if a thick orderbook wall sits between
+    # entry and the current SL, move SL to just past the wall. Walls are
+    # real resting liquidity — price breaking through a $5M+ wall is
+    # strong evidence the thesis is wrong, so that's a better stop than
+    # waiting for the full ICT swing distance. SL can only get TIGHTER
+    # (closer to entry), never looser, and must still respect the ATR
+    # floor computed above.
+    liq_block = market.get("liquidation") or {}
+    walls = liq_block.get("walls") or []
+    if walls and side:
+        def _wall_volume_threshold(walls: list[dict]) -> float:
+            vols = sorted((w["volume_usd"] for w in walls), reverse=True)
+            if not vols:
+                return 0.0
+            # Median of the top 10 walls — "thick enough to matter"
+            top = vols[: min(10, len(vols))]
+            return top[len(top) // 2]
+
+        thresh = _wall_volume_threshold(walls)
+        if side == "long":
+            # Look for thick BIDS sitting strictly between SL and entry
+            between = [
+                w for w in walls
+                if w["side"] == "bid" and sl < w["price"] < entry
+                and w["volume_usd"] >= thresh
+            ]
+            if between:
+                thickest = max(between, key=lambda w: w["volume_usd"])
+                buffer = (entry - sl) * 0.08 or entry * 0.0005
+                new_sl = thickest["price"] - buffer
+                if new_sl > sl:
+                    # Respect the ATR floor we just enforced
+                    if abs(entry - new_sl) >= (min_sl_dist if 'min_sl_dist' in locals() else 0):
+                        reasons.append(
+                            f"SL tightened to bid wall @ {thickest['price']:.2f} "
+                            f"(${thickest['volume_usd']/1e6:.1f}M, was {sl:.2f})"
+                        )
+                        sl = new_sl
+        else:
+            between = [
+                w for w in walls
+                if w["side"] == "ask" and entry < w["price"] < sl
+                and w["volume_usd"] >= thresh
+            ]
+            if between:
+                thickest = max(between, key=lambda w: w["volume_usd"])
+                buffer = (sl - entry) * 0.08 or entry * 0.0005
+                new_sl = thickest["price"] + buffer
+                if new_sl < sl:
+                    if abs(new_sl - entry) >= (min_sl_dist if 'min_sl_dist' in locals() else 0):
+                        reasons.append(
+                            f"SL tightened to ask wall @ {thickest['price']:.2f} "
+                            f"(${thickest['volume_usd']/1e6:.1f}M, was {sl:.2f})"
+                        )
+                        sl = new_sl
 
     # Phase 9: apply regime adjustments to TP/SL.
     regime_adj = (regime or {}).get("adjustments", {})
@@ -738,7 +831,30 @@ def generate_signal(symbol: str, current_price: float, ict: dict, wyckoff: dict,
             sl = entry + sl_dist * sl_mult
         reasons.append(f"Regime '{regime_name}': TP×{tp_mult}, SL×{sl_mult}")
 
+    # Re-enforce the ATR floor AFTER regime mult. Previously the floor ran
+    # first and a regime SL<1.0 multiplier silently shrank the stop back
+    # below the floor (trade #14 2026-04-21: floor set 609.63, ranging
+    # ×0.8 shrank to 487.70 → hit next cycle).
+    if 'min_sl_dist' in locals() and min_sl_dist > 0:
+        post_regime_dist = abs(entry - sl)
+        if post_regime_dist < min_sl_dist:
+            if side == "long":
+                sl = entry - min_sl_dist
+            else:
+                sl = entry + min_sl_dist
+            reasons.append(
+                f"SL floor re-enforced after regime mult: "
+                f"{post_regime_dist:.2f} → {min_sl_dist:.2f}"
+            )
+
     rr = calculate_rr(entry, sl, tp)
+
+    # Counter-zone hard veto: long-in-premium / short-in-discount. These
+    # setups showed poor outcomes on 2026-04-19/20 paper trades and are
+    # now rejected outright rather than merely downscored.
+    if counter_zone_veto:
+        logger.info(f"{symbol}: VETO counter-zone {side} entry in {price_zone} zone. Skipping.")
+        return None
 
     # Enforce minimum RR — per-instrument override or global default.
     min_rr = (instrument or {}).get("min_rr", Config.MIN_RR_RATIO)

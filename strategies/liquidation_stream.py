@@ -342,3 +342,42 @@ def get_real_liquidation_clusters(
 def get_stats() -> dict:
     """Diagnostic counters — intended for /liquidation-stream telemetry."""
     return get_manager().stats()
+
+
+def dump_recent_events(
+    path: str = "/root/trading-bot/data/observed_liquidations.json",
+    window_seconds: float = _WINDOW_SECONDS,
+) -> int:
+    """Dump recent observed liquidations to JSON for cross-process sharing.
+
+    The dashboard runs in its own process and can't see the bot's
+    in-memory buffer, so the bot periodically writes a snapshot that the
+    dashboard reads. Returns the number of events written.
+    """
+    import os
+    mgr = get_manager()
+    cutoff = time.time() - window_seconds
+    all_events: list[dict] = []
+    with mgr._lock:
+        for sym, bucket in mgr._events.items():
+            for e in bucket:
+                if e.ts < cutoff:
+                    continue
+                all_events.append({
+                    "ts": e.ts,
+                    "symbol": sym,
+                    "side": e.side,
+                    "price": e.price,
+                    "qty_usd": e.qty_usd,
+                    "exchange": e.exchange,
+                })
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump({"generated_at": time.time(), "events": all_events}, f)
+        os.replace(tmp, path)
+    except Exception as exc:
+        logger.debug("liquidation dump failed: %s", exc)
+        return 0
+    return len(all_events)

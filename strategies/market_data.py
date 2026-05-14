@@ -165,11 +165,12 @@ def calculate_volume_profile(df: pd.DataFrame, num_levels: int = 20):
 
 
 def _build_liquidation_block(
+    exchange,
     symbol: str,
     current_price: float,
     oi_data: dict | None,
 ) -> dict[str, Any]:
-    """Fetch (or estimate) liquidation clusters + derived magnets.
+    """Fetch real liquidity clusters + derived magnets + orderbook walls.
 
     Best-effort: any failure returns an empty block so downstream
     scoring is a no-op rather than a crash.
@@ -185,18 +186,84 @@ def _build_liquidation_block(
                 or oi_data.get("openInterest")
                 or 0
             )
-        clusters, source = fetch_liquidation_clusters(symbol, current_price, oi_value)
+        clusters, source = fetch_liquidation_clusters(symbol, current_price, oi_value, exchange=exchange)
         magnets = detect_magnets(clusters, current_price)
         asymmetry = compute_asymmetry(magnets)
+
+        # Separate raw orderbook walls (tight, near-price) for SL snapping.
+        walls: list[dict] = []
+        try:
+            from strategies.orderbook_liquidity import fetch_orderbook_walls
+            wall_objs = fetch_orderbook_walls(
+                exchange, symbol, current_price,
+                depth=500, bucket_pct=0.05, top_n_per_side=40,
+            )
+            walls = [
+                {
+                    "price": w.price, "side": w.side,
+                    "volume_usd": w.volume_usd, "distance_pct": w.distance_pct,
+                }
+                for w in wall_objs
+            ]
+        except Exception as exc:
+            logger.debug("orderbook walls fetch failed for %s: %s", symbol, exc)
+
         return {
             "source": source,
             "clusters": clusters,
             "magnets": magnets,
             "asymmetry": asymmetry,
+            "walls": walls,
         }
     except Exception as exc:
         logger.warning("liquidation block failed for %s: %s", symbol, exc)
-        return {"source": "unavailable", "clusters": [], "magnets": [], "asymmetry": {}}
+        return {"source": "unavailable", "clusters": [], "magnets": [], "asymmetry": {}, "walls": []}
+
+
+def _build_volume_profile_deep(exchange, symbol: str, current_price: float) -> dict[str, Any]:
+    """Build the wide-scale 20-day volume profile with HVN/LVN lists.
+
+    Unlike the in-memory calculate_volume_profile which only sees the
+    current signal dataframe, this pulls 500 × 1h candles directly —
+    giving roughly 3 weeks of real traded volume to bucket.
+
+    Returns {hvn: [{price, volume_usd, distance_pct}, …], lvn: [...], poc: price}
+    — empty lists on failure.
+    """
+    if current_price <= 0:
+        return {"hvn": [], "lvn": [], "poc": None, "nodes": []}
+    try:
+        from strategies.volume_profile import fetch_volume_profile
+        nodes = fetch_volume_profile(
+            exchange, symbol, current_price,
+            timeframe="1h", lookback_candles=500, num_buckets=80,
+        )
+        if not nodes:
+            return {"hvn": [], "lvn": [], "poc": None, "nodes": []}
+
+        ranked = sorted(nodes, key=lambda n: n.volume_usd, reverse=True)
+        poc = ranked[0].price
+        # Top 5 non-empty high-volume nodes
+        hvn = [
+            {"price": n.price, "volume_usd": n.volume_usd, "distance_pct": n.distance_pct}
+            for n in ranked[:5] if n.volume_usd > 0
+        ]
+        # Bottom 5 LVNs among buckets that at least have some volume
+        nonzero = [n for n in nodes if n.volume_usd > 0]
+        lvn = [
+            {"price": n.price, "volume_usd": n.volume_usd, "distance_pct": n.distance_pct}
+            for n in sorted(nonzero, key=lambda n: n.volume_usd)[:5]
+        ]
+        return {
+            "hvn": hvn, "lvn": lvn, "poc": poc,
+            "nodes": [
+                {"price": n.price, "volume_usd": n.volume_usd, "distance_pct": n.distance_pct}
+                for n in nodes
+            ],
+        }
+    except Exception as exc:
+        logger.debug("deep volume profile failed for %s: %s", symbol, exc)
+        return {"hvn": [], "lvn": [], "poc": None, "nodes": []}
 
 
 def _build_manipulation_block(
@@ -273,9 +340,15 @@ def analyze_market_data(
 
     current_price = float(df.iloc[-1]["close"]) if len(df) else 0.0
     liquidation_block = (
-        _build_liquidation_block(symbol, current_price, oi)
+        _build_liquidation_block(exchange, symbol, current_price, oi)
         if has_funding and current_price > 0
-        else {"source": "disabled", "clusters": [], "magnets": [], "asymmetry": {}}
+        else {"source": "disabled", "clusters": [], "magnets": [], "asymmetry": {}, "walls": []}
+    )
+
+    volume_profile_deep = (
+        _build_volume_profile_deep(exchange, symbol, current_price)
+        if current_price > 0
+        else {"hvn": [], "lvn": [], "poc": None, "nodes": []}
     )
 
     manipulation_block = _build_manipulation_block(
@@ -287,6 +360,7 @@ def analyze_market_data(
         "open_interest": analyze_open_interest(oi, price_change),
         "kill_zone": get_current_kill_zone(kill_zones, instrument=instrument),
         "volume_profile": calculate_volume_profile(df),
+        "volume_profile_deep": volume_profile_deep,
         "liquidation": liquidation_block,
         "manipulation": manipulation_block,
     }

@@ -160,7 +160,13 @@ class PaperTrader:
             # ---- SL check first — stops ALWAYS take precedence ----
             if (side == "long" and price <= pos["sl_price"]) or \
                (side == "short" and price >= pos["sl_price"]):
-                self._close_full(pos, tid, pos["sl_price"], "SL")
+                # Distinguish a pure SL from a runner-SL (partials filled
+                # first, then the remainder hit the trailed/BE stop).
+                # Previously both were labelled "SL", hiding +R outcomes.
+                plan = pos.get("tp_plan") or {}
+                tps_filled = sum(1 for lvl in plan.get("levels", []) if lvl.get("filled"))
+                result_label = f"SL_RUNNER_TP{tps_filled}" if tps_filled > 0 else "SL"
+                self._close_full(pos, tid, pos["sl_price"], result_label)
                 events.append(pos)
                 continue
 
